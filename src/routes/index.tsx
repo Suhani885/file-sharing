@@ -8,507 +8,754 @@ import {
   Progress,
   Tag,
   Spin,
+  Steps,
+  Space,
+  Alert,
+  Tooltip,
+  Row,
+  Col,
+  message,
+  theme,
 } from "antd";
-import { UploadOutlined } from "@ant-design/icons";
+import {
+  UploadOutlined,
+  CopyOutlined,
+  InfoCircleOutlined,
+  DownloadOutlined,
+} from "@ant-design/icons";
 import Peer from "peerjs";
 import type { DataConnection } from "peerjs";
 import { useState, useRef, useEffect } from "react";
 
-const { Title, Text } = Typography;
+const { Title, Text, Paragraph } = Typography;
+const { useToken } = theme;
 
 export const Route = createFileRoute("/")({
   component: Home,
 });
 
 function Home() {
+  const { token } = useToken();
+  const [messageApi, contextHolder] = message.useMessage();
+
   const [myId, setMyId] = useState("");
-  const [connectToId, setConnectToId] = useState("");
-  const [connected, setConnected] = useState(false);
-  const [connectedTo, setConnectedTo] = useState("");
-  const [connecting, setConnecting] = useState(false);
-  const [files, setFiles] = useState<
+  const [targetId, setTargetId] = useState("");
+  const [isConnected, setIsConnected] = useState(false);
+  const [connectedPeer, setConnectedPeer] = useState("");
+  const [isConnecting, setIsConnecting] = useState(false);
+
+  const [receivedFiles, setReceivedFiles] = useState<
     {
       name: string;
-      url: string | null;
-      progress: number;
+      downloadUrl: string | null;
+      percent: number;
       status: "receiving" | "done" | "cancelled";
+      totalSize: number;
+      receivedSize: number;
     }[]
   >([]);
-  const [sendingFiles, setSendingFiles] = useState<
+
+  const [sentFiles, setSentFiles] = useState<
     {
       name: string;
-      progress: number;
+      percent: number;
       status: "sending" | "done" | "cancelled";
     }[]
   >([]);
 
-  const peerRef = useRef<Peer | null>(null);
-  const connectionRef = useRef<DataConnection | null>(null);
-  const fileChunksRef = useRef<Record<string, BlobPart[]>>({});
-  const activeTransfersRef = useRef<Record<string, { cancelled: boolean }>>({});
+  const peer = useRef<Peer | null>(null);
+  const connection = useRef<DataConnection | null>(null);
+  const fileChunks = useRef<Record<string, BlobPart[]>>({});
+  const fileMetadata = useRef<Record<string, { size: number; type: string }>>(
+    {}
+  );
+  const cancelledTransfers = useRef<Record<string, boolean>>({});
 
   useEffect(() => {
-    const peer = new Peer();
-    peer.on("open", function (id) {
+    const newPeer = new Peer();
+
+    newPeer.on("open", function (id) {
       setMyId(id);
     });
-    peer.on("connection", function (conn) {
-      connectionRef.current = conn;
+
+    newPeer.on("connection", function (conn) {
+      connection.current = conn;
       conn.on("open", function () {
-        setConnectedTo(conn.peer);
-        setConnected(true);
-        conn.on("data", acceptFile);
+        setConnectedPeer(conn.peer);
+        setIsConnected(true);
+        messageApi.success(`Connected to peer: ${conn.peer}`);
+        conn.on("data", handleIncomingData);
       });
     });
-    peerRef.current = peer;
+
+    newPeer.on("error", function (err) {
+      messageApi.error("Failed to initialize peer connection");
+      console.error("Peer error:", err);
+    });
+
+    peer.current = newPeer;
 
     return () => {
-      if (peerRef.current) {
-        peerRef.current.destroy();
+      if (peer.current) {
+        peer.current.destroy();
       }
     };
-  }, []);
+  }, [messageApi]);
+
+  const copyToClipboard = (text: string) => {
+    navigator.clipboard.writeText(text);
+    messageApi.success("ID copied to clipboard!");
+  };
 
   const connectToPeer = () => {
-    if (!peerRef.current || !connectToId.trim()) return;
+    if (!peer.current || !targetId.trim()) return;
 
-    setConnecting(true);
+    setIsConnecting(true);
     try {
-      const conn = peerRef.current.connect(connectToId.trim());
-      connectionRef.current = conn;
+      const conn = peer.current.connect(targetId.trim());
+      connection.current = conn;
 
       conn.on("open", function () {
-        setConnectedTo(conn.peer);
-        setConnected(true);
-        setConnecting(false);
-        conn.on("data", acceptFile);
+        setConnectedPeer(conn.peer);
+        setIsConnected(true);
+        setIsConnecting(false);
+        messageApi.success(`Successfully connected to ${conn.peer}`);
+        conn.on("data", handleIncomingData);
       });
 
       conn.on("error", function (err) {
-        setConnecting(false);
-        alert("Failed to connect to peer");
+        setIsConnecting(false);
+        messageApi.error("Failed to connect to peer!");
         console.error("Connection error:", err);
       });
     } catch (error) {
-      setConnecting(false);
-      alert("Failed to connect to peer");
+      setIsConnecting(false);
+      messageApi.error("Failed to establish connection");
       console.error("Failed to connect:", error);
     }
   };
 
   const sendFile = (fileList: any[]) => {
-    if (!connectionRef.current || !connectionRef.current.open) {
-      alert("No device connected.");
+    if (!connection.current || !connection.current.open) {
+      messageApi.warning(
+        "No device connected. Please connect to a peer first."
+      );
       return;
     }
 
     const uploadedFile = fileList[0];
     if (!uploadedFile) return;
 
-    const actualFile = uploadedFile.originFileObj;
-    if (!actualFile) return;
+    const file = uploadedFile.originFileObj;
+    if (!file) return;
 
     const CHUNK_SIZE = 1024 * 1024;
-    const fileReader = new FileReader();
-    let currentPosition = 0;
+    const reader = new FileReader();
+    let position = 0;
 
-    addFileToSendingList(actualFile.name);
+    addToSentList(file.name);
+    messageApi.info(`Started sending: ${file.name}`);
 
-    fileReader.onload = (event) => {
+    reader.onload = (event) => {
       const fileData = event.target?.result as ArrayBuffer;
       if (!fileData) return;
 
-      const fileSize = actualFile.size;
-      const fileType = actualFile.type;
-      const fileName = actualFile.name;
+      const fileName = file.name;
+      const fileSize = file.size;
+      const fileType = file.type;
 
-      activeTransfersRef.current[fileName] = { cancelled: false };
+      cancelledTransfers.current[fileName] = false;
+
+      connection.current?.send({
+        type: "metadata",
+        fileName: fileName,
+        fileSize: fileSize,
+        fileType: fileType,
+      });
 
       sendNextChunk();
 
       function sendNextChunk() {
-        if (activeTransfersRef.current[fileName]?.cancelled) return;
+        if (cancelledTransfers.current[fileName]) return;
 
-        const endPosition = Math.min(currentPosition + CHUNK_SIZE, fileSize);
-        const chunk = fileData.slice(currentPosition, endPosition);
-        const isThisTheLastChunk = endPosition >= fileSize;
+        const endPos = Math.min(position + CHUNK_SIZE, fileSize);
+        const chunk = fileData.slice(position, endPos);
+        const isLast = endPos >= fileSize;
+        const percent = Math.round((endPos / fileSize) * 100);
 
-        const progressPercentage = Math.round((endPosition / fileSize) * 100);
-
-        connectionRef.current?.send({
+        connection.current?.send({
+          type: "chunk",
           chunk: chunk,
-          isLast: isThisTheLastChunk,
-          mimeType: fileType,
+          isLast: isLast,
           fileName: fileName,
-          progress: progressPercentage,
         });
 
-        currentPosition = endPosition;
+        position = endPos;
+        updateSentProgress(fileName, percent);
 
-        updateSendingProgress(fileName, progressPercentage);
-
-        if (!isThisTheLastChunk) {
-          setTimeout(sendNextChunk, 0);
+        if (!isLast) {
+          setTimeout(sendNextChunk, 10);
         } else {
-          markFileAsSent(fileName);
-          delete activeTransfersRef.current[fileName];
+          markSentComplete(fileName);
         }
       }
     };
 
-    fileReader.readAsArrayBuffer(actualFile);
+    reader.readAsArrayBuffer(file);
   };
 
-  const addFileToSendingList = (fileName: string) => {
-    setSendingFiles((currentFiles) => {
-      const fileAlreadyExists = currentFiles.find(
-        (file) => file.name === fileName
-      );
+  const addToSentList = (fileName: string) => {
+    setSentFiles((current) => {
+      const exists = current.find((f) => f.name === fileName);
 
-      if (fileAlreadyExists) {
-        return currentFiles.map((file) =>
-          file.name === fileName
-            ? { ...file, progress: 0, status: "sending" }
-            : file
+      if (exists) {
+        return current.map((f) =>
+          f.name === fileName ? { ...f, percent: 0, status: "sending" } : f
         );
       } else {
-        return [
-          ...currentFiles,
-          { name: fileName, progress: 0, status: "sending" },
-        ];
+        return [...current, { name: fileName, percent: 0, status: "sending" }];
       }
     });
   };
 
-  const updateSendingProgress = (
-    fileName: string,
-    progressPercentage: number
-  ) => {
-    setSendingFiles((currentFiles) =>
-      currentFiles.map((file) =>
-        file.name === fileName
-          ? { ...file, progress: progressPercentage }
-          : file
+  const updateSentProgress = (fileName: string, percent: number) => {
+    setSentFiles((current) =>
+      current.map((f) => (f.name === fileName ? { ...f, percent: percent } : f))
+    );
+  };
+
+  const markSentComplete = (fileName: string) => {
+    setSentFiles((current) =>
+      current.map((f) =>
+        f.name === fileName ? { ...f, percent: 100, status: "done" } : f
       )
     );
   };
 
-  const markFileAsSent = (fileName: string) => {
-    setSendingFiles((currentFiles) =>
-      currentFiles.map((file) =>
-        file.name === fileName
-          ? { ...file, progress: 100, status: "done" }
-          : file
+  const cancelSending = (fileName: string) => {
+    cancelledTransfers.current[fileName] = true;
+
+    connection.current?.send({
+      type: "cancel",
+      fileName: fileName,
+    });
+
+    setSentFiles((current) =>
+      current.map((f) =>
+        f.name === fileName ? { ...f, status: "cancelled" } : f
       )
     );
   };
 
-  const cancelSendingFile = (fileName: string) => {
-    if (activeTransfersRef.current[fileName]) {
-      activeTransfersRef.current[fileName].cancelled = true;
-
-      connectionRef.current?.send({ type: "cancel", fileName });
-
-      setSendingFiles((prev) =>
-        prev.map((f) =>
-          f.name === fileName ? { ...f, status: "cancelled" } : f
-        )
-      );
+  const handleIncomingData = (data: any) => {
+    if (data?.type === "metadata") {
+      handleFileMetadata(data);
+    } else if (data?.type === "chunk") {
+      handleFileChunk(data);
+    } else if (data?.type === "cancel") {
+      handleCancel(data);
     }
   };
 
-  type FileChunkData = {
-    chunk: BlobPart;
-    isLast: boolean;
-    mimeType?: string;
-    fileName?: string;
-    progress?: number;
-    type?: string;
-  };
+  const handleFileMetadata = (data: any) => {
+    const { fileName, fileSize, fileType } = data;
 
-  const acceptFile = (incomingData: unknown) => {
-    const receivedData = incomingData as FileChunkData;
+    fileMetadata.current[fileName] = { size: fileSize, type: fileType };
+    fileChunks.current[fileName] = [];
 
-    if (receivedData?.type === "cancel") {
-      handleFileCancellation(receivedData);
-      return;
-    }
+    setReceivedFiles((current) => {
+      const exists = current.find((f) => f.name === fileName);
 
-    if (isValidFileChunk(receivedData)) {
-      processFileChunk(receivedData);
-    } else {
-      alert("Not a File.");
-    }
-  };
-
-  const handleFileCancellation = (cancelData: FileChunkData) => {
-    const fileName = cancelData.fileName;
-
-    if (fileName) {
-      delete fileChunksRef.current[fileName];
-
-      setFiles((currentFiles) =>
-        currentFiles.map((file) =>
-          file.name === fileName ? { ...file, status: "cancelled" } : file
-        )
-      );
-    }
-  };
-
-  const isValidFileChunk = (data: any) => {
-    return (
-      typeof data === "object" &&
-      data !== null &&
-      "chunk" in data &&
-      "isLast" in data
-    );
-  };
-
-  const processFileChunk = (chunkData: FileChunkData) => {
-    const fileName = chunkData.fileName || "download";
-    const fileType = chunkData.mimeType || "application/octet-stream";
-    const currentProgress = chunkData.progress || 0;
-    const isLastChunk = chunkData.isLast;
-    const fileChunk = chunkData.chunk;
-
-    if (!fileChunksRef.current[fileName]) {
-      setupNewIncomingFile(fileName);
-    }
-
-    fileChunksRef.current[fileName].push(fileChunk);
-
-    updateReceivingProgress(fileName, currentProgress, isLastChunk);
-
-    if (isLastChunk) {
-      createCompleteFile(fileName, fileType);
-    }
-  };
-
-  const setupNewIncomingFile = (fileName: string) => {
-    fileChunksRef.current[fileName] = [];
-
-    setFiles((currentFiles) => {
-      const fileAlreadyExists = currentFiles.find(
-        (file) => file.name === fileName
-      );
-
-      if (fileAlreadyExists) {
-        return currentFiles.map((file) =>
-          file.name === fileName
-            ? { ...file, url: null, progress: 0, status: "receiving" }
-            : file
+      if (exists) {
+        return current.map((f) =>
+          f.name === fileName
+            ? {
+                ...f,
+                downloadUrl: null,
+                percent: 0,
+                status: "receiving",
+                totalSize: fileSize,
+                receivedSize: 0,
+              }
+            : f
         );
       } else {
         return [
-          ...currentFiles,
+          ...current,
           {
             name: fileName,
-            url: null,
-            progress: 0,
+            downloadUrl: null,
+            percent: 0,
             status: "receiving",
+            totalSize: fileSize,
+            receivedSize: 0,
           },
         ];
       }
     });
   };
 
-  const updateReceivingProgress = (
-    fileName: string,
-    progressPercentage: number,
-    isComplete: boolean
-  ) => {
-    setFiles((currentFiles) =>
-      currentFiles.map((file) =>
-        file.name === fileName
+  const handleFileChunk = (data: any) => {
+    const { chunk, isLast, fileName } = data;
+
+    if (!fileChunks.current[fileName]) return;
+
+    fileChunks.current[fileName].push(chunk);
+
+    const metadata = fileMetadata.current[fileName];
+    if (!metadata) return;
+
+    const currentSize = fileChunks.current[fileName].length * 1024 * 1024;
+    const actualSize = Math.min(currentSize, metadata.size);
+    const percent = Math.round((actualSize / metadata.size) * 100);
+
+    setReceivedFiles((current) =>
+      current.map((f) =>
+        f.name === fileName
           ? {
-              ...file,
-              progress: isComplete ? 100 : progressPercentage,
-              status: isComplete ? "done" : "receiving",
+              ...f,
+              percent: isLast ? 100 : percent,
+              status: isLast ? "done" : "receiving",
+              receivedSize: actualSize,
             }
-          : file
+          : f
       )
     );
+
+    if (isLast) {
+      createDownloadFile(fileName);
+    }
   };
 
-  const createCompleteFile = (fileName: string, fileType: string) => {
-    const allChunks = fileChunksRef.current[fileName];
-    const completeFile = new Blob(allChunks, { type: fileType });
+  const handleCancel = (data: any) => {
+    const fileName = data.fileName;
 
-    const downloadUrl = URL.createObjectURL(completeFile);
+    if (fileName && fileChunks.current[fileName]) {
+      delete fileChunks.current[fileName];
+      delete fileMetadata.current[fileName];
 
-    setFiles((currentFiles) =>
-      currentFiles.map((file) =>
-        file.name === fileName
+      setReceivedFiles((current) =>
+        current.map((f) =>
+          f.name === fileName ? { ...f, status: "cancelled" } : f
+        )
+      );
+    }
+  };
+
+  const createDownloadFile = (fileName: string) => {
+    const chunks = fileChunks.current[fileName];
+    const metadata = fileMetadata.current[fileName];
+
+    if (!chunks || !metadata) return;
+
+    const completeFile = new Blob(chunks, { type: metadata.type });
+    const url = URL.createObjectURL(completeFile);
+
+    setReceivedFiles((current) =>
+      current.map((f) =>
+        f.name === fileName
           ? {
-              ...file,
-              url: downloadUrl,
-              progress: 100,
+              ...f,
+              downloadUrl: url,
+              percent: 100,
               status: "done",
             }
-          : file
+          : f
       )
     );
 
-    fileChunksRef.current[fileName] = [];
+    delete fileChunks.current[fileName];
+    delete fileMetadata.current[fileName];
+  };
+
+  const getCurrentStep = () => {
+    if (!myId) return 0;
+    if (!isConnected) return 1;
+    return 2;
+  };
+
+  const formatFileSize = (bytes: number) => {
+    if (bytes === 0) return "0 Bytes";
+    const k = 1024;
+    const sizes = ["Bytes", "KB", "MB", "GB"];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + " " + sizes[i];
   };
 
   return (
-    <div className="min-h-screen bg-gray-100 flex items-center justify-center p-6">
-      <Card
-        className="w-full max-w-2xl shadow-xl rounded-2xl border border-gray-200"
-        style={{ background: "#ffffff" }}
+    <>
+      {contextHolder}
+      <div
+        className="min-h-screen p-4 sm:p-6"
+        style={{
+          background: `linear-gradient(135deg, ${token.colorBgContainer} 0%, ${token.colorPrimaryBg} 100%)`,
+        }}
       >
-        <div className="text-center mb-6">
-          <Title level={3} className="!mb-1">
-            🔗 P2P File Sharing
-          </Title>
-          <Text type="secondary">
-            Connect with peers and share files directly
-          </Text>
-        </div>
-
-        <Card className="mb-6 rounded-lg shadow-sm bg-gray-50">
-          <Text strong>My ID:</Text>
-          {myId ? (
-            <div className="mt-2 flex gap-2">
-              <Input
-                value={myId}
-                readOnly
-                className="font-mono"
-                style={{ backgroundColor: "#f9f9f9" }}
-              />
-            </div>
-          ) : (
-            <div className="mt-2">
-              <Spin size="small" /> Generating peer ID...
-            </div>
-          )}
-        </Card>
-
-        <Card className="mb-6 rounded-lg shadow-sm bg-gray-50">
-          <Text strong>Connect to Peer:</Text>
-          <div className="mt-3 flex gap-2">
-            <Input
-              placeholder="Enter Peer ID"
-              value={connectToId}
-              onChange={(e) => setConnectToId(e.target.value)}
-              disabled={connected}
-              onPressEnter={connectToPeer}
-            />
-            <Button
-              type="primary"
-              onClick={connectToPeer}
-              disabled={!myId || connected || !connectToId.trim() || connecting}
-              loading={connecting}
-            >
-              {connecting ? "Connecting..." : "Connect"}
-            </Button>
+        <div className="max-w-7xl mx-auto">
+          <div className="text-center mb-8">
+            <Title level={1} className="!mb-2">
+              🔗 P2P File Sharing
+            </Title>
+            <Paragraph className="text-lg" type="secondary">
+              Share files directly between devices
+            </Paragraph>
           </div>
-          <div className="mt-3">
-            {connected ? (
-              <Tag color="green" className="px-3 py-1 text-sm rounded-full">
-                Connected to {connectedTo}
-              </Tag>
-            ) : (
-              <Tag color="red" className="px-3 py-1 text-sm rounded-full">
-                Not Connected
-              </Tag>
-            )}
-          </div>
-        </Card>
 
-        <Card className="mb-6 rounded-lg shadow-sm bg-gray-50">
-          <Text strong>Send File</Text>
-          <div className="mt-4 text-center">
-            <Upload
-              beforeUpload={() => false}
-              showUploadList={false}
-              disabled={!connected}
-              onChange={(info) => {
-                if (info.fileList.length > 0) {
-                  const latestFile = info.fileList[info.fileList.length - 1];
-                  sendFile([latestFile]);
+          <Row gutter={[24, 24]} className="mb-6">
+            <Col xs={24} lg={8}>
+              <Card
+                className="h-full shadow-sm"
+                styles={{
+                  body: { padding: "24px" },
+                  header: {
+                    borderBottom: `1px solid ${token.colorBorderSecondary}`,
+                  },
+                }}
+                title={
+                  <div className="flex items-center">
+                    <InfoCircleOutlined className="mr-2" />
+                    How to Use
+                  </div>
                 }
-              }}
-            >
-              <Button
-                icon={<UploadOutlined />}
-                disabled={!connected}
-                size="large"
-                type="dashed"
               >
-                Select File
-              </Button>
-            </Upload>
-            {!connected && (
-              <p className="text-gray-400 text-xs mt-2">
-                Connect to a peer to enable file sharing
-              </p>
-            )}
-          </div>
-
-          {sendingFiles.map((f) => (
-            <div key={f.name} className="mt-4">
-              <div className="flex justify-between items-center mb-1">
-                <Text className="text-sm">{f.name}</Text>
-                {f.status === "sending" && (
-                  <Button
-                    danger
-                    size="small"
-                    onClick={() => cancelSendingFile(f.name)}
-                  >
-                    Cancel
-                  </Button>
-                )}
-              </div>
-              <Progress
-                percent={f.progress}
-                status={
-                  f.status === "done"
-                    ? "success"
-                    : f.status === "cancelled"
-                      ? "exception"
-                      : "active"
-                }
-              />
-            </div>
-          ))}
-        </Card>
-
-        {files.length > 0 && (
-          <Card className="rounded-lg shadow-sm bg-gray-50">
-            <Text strong>Received Files</Text>
-            {files.map((f) => (
-              <div key={f.name} className="mt-4">
-                <div className="flex justify-between items-center mb-1">
-                  <Text className="text-sm">{f.name}</Text>
-                  {f.url && f.status === "done" && (
-                    <Button type="primary" size="small">
-                      <a
-                        href={f.url}
-                        download={f.name}
-                        className="text-white no-underline"
-                      >
-                        Download
-                      </a>
-                    </Button>
-                  )}
-                </div>
-                <Progress
-                  percent={f.progress}
-                  status={
-                    f.status === "done"
-                      ? "success"
-                      : f.status === "cancelled"
-                        ? "exception"
-                        : "active"
-                  }
+                <Steps
+                  direction="vertical"
+                  current={getCurrentStep()}
+                  className="custom-steps"
+                  items={[
+                    {
+                      title: (
+                        <span className="text-black font-semibold">
+                          Generate Your ID
+                        </span>
+                      ),
+                      description: (
+                        <div className="text-gray-700">
+                          Wait for your unique peer ID to be generated
+                          automatically
+                        </div>
+                      ),
+                    },
+                    {
+                      title: (
+                        <span className="text-black font-semibold">
+                          Connect to Peer
+                        </span>
+                      ),
+                      description: (
+                        <div className="text-gray-700">
+                          Share your ID with someone or enter their ID to
+                          connect
+                        </div>
+                      ),
+                    },
+                    {
+                      title: (
+                        <span className="text-black font-semibold">
+                          Share Files
+                        </span>
+                      ),
+                      description: (
+                        <div className="text-gray-700">
+                          Select and send files directly to the connected peer
+                        </div>
+                      ),
+                    },
+                  ]}
                 />
-              </div>
-            ))}
-          </Card>
-        )}
-      </Card>
-    </div>
+
+                {isConnected && (
+                  <Alert
+                    message="Ready to Share!"
+                    description="You can now send and receive files"
+                    type="success"
+                    showIcon
+                    className="mt-4"
+                  />
+                )}
+              </Card>
+            </Col>
+
+            <Col xs={24} lg={16}>
+              <Space direction="vertical" className="w-full" size="large">
+                <Card
+                  className="shadow-sm"
+                  title={<div className="flex items-center">Your Peer ID</div>}
+                >
+                  {myId ? (
+                    <div className="flex gap-3">
+                      <Input
+                        value={myId}
+                        readOnly
+                        className="font-mono"
+                        size="large"
+                        style={{
+                          backgroundColor: token.colorFillTertiary,
+                        }}
+                      />
+                      <Tooltip title="Copy ID to clipboard">
+                        <Button
+                          icon={<CopyOutlined />}
+                          onClick={() => copyToClipboard(myId)}
+                          size="large"
+                          type="primary"
+                        >
+                          Copy
+                        </Button>
+                      </Tooltip>
+                    </div>
+                  ) : (
+                    <div className="flex items-center py-2">
+                      <Spin className="mr-3" />
+                      <Text>Generating your unique peer ID...</Text>
+                    </div>
+                  )}
+                </Card>
+                <Card
+                  className="shadow-sm"
+                  title={
+                    <div className="flex items-center">Connect to Peer</div>
+                  }
+                >
+                  <Space direction="vertical" className="w-full" size="middle">
+                    <div className="flex gap-3">
+                      <Input
+                        placeholder="Enter the other person's Peer ID"
+                        value={targetId}
+                        onChange={(e) => setTargetId(e.target.value)}
+                        disabled={isConnected}
+                        onPressEnter={connectToPeer}
+                        size="large"
+                        style={{ flex: 1 }}
+                      />
+                      <Button
+                        type="primary"
+                        onClick={connectToPeer}
+                        disabled={
+                          !myId ||
+                          isConnected ||
+                          !targetId.trim() ||
+                          isConnecting
+                        }
+                        loading={isConnecting}
+                        size="large"
+                      >
+                        {isConnecting ? "Connecting..." : "Connect"}
+                      </Button>
+                    </div>
+
+                    <div>
+                      {isConnected ? (
+                        <Tag color="success" className="px-3 py-1">
+                          Connected to {connectedPeer}
+                        </Tag>
+                      ) : (
+                        <Tag color="error" className="px-3 py-1">
+                          Not Connected
+                        </Tag>
+                      )}
+                    </div>
+                  </Space>
+                </Card>
+              </Space>
+            </Col>
+          </Row>
+
+          <Row gutter={[24, 24]}>
+            <Col xs={24} lg={12}>
+              <Card
+                className="shadow-sm h-full"
+                title={<div className="flex items-center">Send Files</div>}
+              >
+                <div className="text-center mb-6">
+                  <Upload.Dragger
+                    beforeUpload={() => false}
+                    showUploadList={false}
+                    disabled={!isConnected}
+                    onChange={(info) => {
+                      if (info.fileList.length > 0) {
+                        const latestFile =
+                          info.fileList[info.fileList.length - 1];
+                        sendFile([latestFile]);
+                      }
+                    }}
+                    style={{
+                      backgroundColor: isConnected
+                        ? token.colorPrimaryBg
+                        : token.colorFillTertiary,
+                      borderColor: isConnected
+                        ? token.colorPrimary
+                        : token.colorBorder,
+                    }}
+                  >
+                    <p className="ant-upload-drag-icon">
+                      <UploadOutlined
+                        style={{
+                          fontSize: "3rem",
+                          color: isConnected
+                            ? token.colorPrimary
+                            : token.colorTextTertiary,
+                        }}
+                      />
+                    </p>
+                    <p
+                      className="ant-upload-text"
+                      style={{ fontSize: "1.1rem" }}
+                    >
+                      {isConnected
+                        ? "Click or drag file to upload"
+                        : "Connect to enable file sharing"}
+                    </p>
+                    <p className="ant-upload-hint">
+                      {isConnected
+                        ? "Select any file to send to the connected peer"
+                        : "You need to connect to another peer first"}
+                    </p>
+                  </Upload.Dragger>
+                </div>
+
+                <div className="space-y-4">
+                  {sentFiles.map((f, index) => (
+                    <Card
+                      key={`${f.name}-${index}`}
+                      size="small"
+                      className={`${
+                        f.status === "done"
+                          ? "bg-green-50 border-green-200"
+                          : f.status === "cancelled"
+                            ? "bg-red-50 border-red-200"
+                            : "bg-blue-50 border-blue-200"
+                      }`}
+                    >
+                      <div className="flex justify-between items-start mb-3">
+                        <div className="flex-1 min-w-0">
+                          <Text strong className="block truncate">
+                            {f.name}
+                          </Text>
+                          <Text type="secondary" className="text-sm">
+                            {f.status === "sending" &&
+                              `Sending... ${f.percent}%`}
+                            {f.status === "done" && "Sent successfully"}
+                            {f.status === "cancelled" && "Cancelled"}
+                          </Text>
+                        </div>
+                        {f.status === "sending" && (
+                          <Button
+                            danger
+                            size="small"
+                            onClick={() => cancelSending(f.name)}
+                          >
+                            Cancel
+                          </Button>
+                        )}
+                      </div>
+                      <Progress
+                        percent={f.percent}
+                        status={
+                          f.status === "done"
+                            ? "success"
+                            : f.status === "cancelled"
+                              ? "exception"
+                              : "active"
+                        }
+                        strokeWidth={6}
+                      />
+                    </Card>
+                  ))}
+                </div>
+              </Card>
+            </Col>
+
+            <Col xs={24} lg={12}>
+              <Card
+                className="shadow-sm h-full"
+                title={
+                  <div className="flex items-center">
+                    Received Files
+                    {receivedFiles.length > 0 && (
+                      <Tag color="blue" className="ml-2">
+                        {receivedFiles.length}
+                      </Tag>
+                    )}
+                  </div>
+                }
+              >
+                {receivedFiles.length === 0 ? (
+                  <div className="text-center py-12">
+                    <DownloadOutlined
+                      style={{
+                        fontSize: "3rem",
+                        color: token.colorTextTertiary,
+                        marginBottom: "1rem",
+                      }}
+                    />
+                    <Text type="secondary" className="block text-lg">
+                      No files received yet
+                    </Text>
+                    <Text type="secondary">
+                      Files sent to you will appear here
+                    </Text>
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    {receivedFiles.map((f, index) => (
+                      <Card
+                        key={`${f.name}-${index}`}
+                        size="small"
+                        className={`${
+                          f.status === "done"
+                            ? "bg-green-50 border-green-200"
+                            : f.status === "cancelled"
+                              ? "bg-red-50 border-red-200"
+                              : "bg-orange-50 border-orange-200"
+                        }`}
+                      >
+                        <div className="flex justify-between items-start mb-3">
+                          <div className="flex-1 min-w-0">
+                            <Text strong className="block truncate">
+                              {f.name}
+                            </Text>
+                            <Text type="secondary" className="text-sm">
+                              {f.status === "receiving" &&
+                                `Receiving... ${formatFileSize(f.receivedSize)} / ${formatFileSize(f.totalSize)}`}
+                              {f.status === "done" &&
+                                `Ready to download (${formatFileSize(f.totalSize)})`}
+                              {f.status === "cancelled" && "Transfer cancelled"}
+                            </Text>
+                          </div>
+                          {f.downloadUrl && f.status === "done" && (
+                            <Button type="primary" size="small">
+                              <a
+                                href={f.downloadUrl}
+                                download={f.name}
+                                className="text-white no-underline"
+                              >
+                                <DownloadOutlined className="mr-1" />
+                                Download
+                              </a>
+                            </Button>
+                          )}
+                        </div>
+                        <Progress
+                          percent={f.percent}
+                          status={
+                            f.status === "done"
+                              ? "success"
+                              : f.status === "cancelled"
+                                ? "exception"
+                                : "active"
+                          }
+                          strokeWidth={6}
+                        />
+                      </Card>
+                    ))}
+                  </div>
+                )}
+              </Card>
+            </Col>
+          </Row>
+        </div>
+      </div>
+    </>
   );
 }
