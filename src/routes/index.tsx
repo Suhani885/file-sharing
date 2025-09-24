@@ -10,7 +10,6 @@ import {
   Spin,
   Steps,
   Space,
-  Alert,
   Tooltip,
   Row,
   Col,
@@ -154,7 +153,6 @@ function Home() {
     let position = 0;
 
     addToSentList(file.name);
-    messageApi.info(`Started sending: ${file.name}`);
 
     reader.onload = (event) => {
       const fileData = event.target?.result as ArrayBuffer;
@@ -463,16 +461,6 @@ function Home() {
                     },
                   ]}
                 />
-
-                {isConnected && (
-                  <Alert
-                    message="Ready to Share!"
-                    description="You can now send and receive files"
-                    type="success"
-                    showIcon
-                    className="mt-4"
-                  />
-                )}
               </Card>
             </Col>
 
