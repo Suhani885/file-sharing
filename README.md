@@ -6,6 +6,7 @@ A modern **peer-to-peer file sharing app** built with:
 * **TanStack Start (React framework)** for fast routing
 * **TypeScript** for reliability
 * **Tailwind CSS** for sleek, responsive UI
+* **Ant Design** for elegant and reusable UI components
 
 Files are transferred **directly between browsers** — no server storage, no middleman.
 
